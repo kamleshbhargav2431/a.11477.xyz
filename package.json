@@ -10,6 +10,9 @@
   },
   "dependencies": {
     "next": "14.2.3",
-    "mysql2": "^3.9.7"
+    "mysql2": "^3.9.7",
+    "redis": "^4.6.13",
+    "https-proxy-agent": "^7.0.4",
+    "dotenv": "^16.4.5"
   }
 }

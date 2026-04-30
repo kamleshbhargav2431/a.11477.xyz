@@ -1,5 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: 'standalone', // required for Docker/Coolify deployment
+  experimental: {
+    serverComponentsExternalPackages: ['mysql2', 'redis'],
+  },
 };
 module.exports = nextConfig;

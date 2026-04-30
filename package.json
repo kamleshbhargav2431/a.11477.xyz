@@ -9,7 +9,7 @@
     "migrate": "node scripts/migrate.js"
   },
   "dependencies": {
-    "next": "14.2.3",
+    "next": "15.3.1",
     "mysql2": "^3.9.7",
     "redis": "^4.6.13",
     "https-proxy-agent": "^7.0.4",

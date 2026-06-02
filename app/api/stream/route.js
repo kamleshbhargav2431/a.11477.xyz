@@ -9,28 +9,49 @@ import { redisGet, redisSet, redisKey } from '@/lib/redis';
 import { NextResponse }                 from 'next/server';
 import { HttpsProxyAgent }              from 'https-proxy-agent';
 import * as cheerio                     from 'cheerio';
+import http                             from 'http';
+import https                            from 'https';
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const PROXY_URL    = `http://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}:${process.env.PROXY_PORT}`;
 const BASE_URL     = 'https://a.111477.xyz';
+const proxyAgent   = new HttpsProxyAgent(PROXY_URL);
 
 // ============================================================
-//  PROXY FETCH — with 3 retries + exponential backoff
+//  PROXY FETCH — Node.js native https (bypasses Next.js undici)
+//  with 3 retries + exponential backoff
 // ============================================================
 async function proxyFetch(url, retries = 3, timeout = 30000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(url, {
-        agent  : new HttpsProxyAgent(PROXY_URL),
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-          'Accept'    : 'application/json, text/html, */*',
-        },
-        redirect: 'follow',
-        signal  : AbortSignal.timeout(timeout),
+      const result = await new Promise((resolve, reject) => {
+        const mod = url.startsWith('https') ? https : http;
+        const req = mod.get(url, {
+          agent: proxyAgent,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            'Accept'    : 'application/json, text/html, */*',
+          },
+          timeout,
+        }, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            proxyFetch(res.headers.location, 1, timeout).then(resolve).catch(reject);
+            res.resume();
+            return;
+          }
+          let data = '';
+          res.on('data', c => data += c);
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) resolve(data);
+            else if (res.statusCode >= 500 || res.statusCode === 429) reject(new Error(`HTTP ${res.statusCode}`));
+            else resolve(null);
+          });
+          res.on('error', reject);
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
       });
-      if (res.ok) return await res.text();
-      if (res.status < 500 && res.status !== 429) return null;
+      if (result !== undefined) return result;
     } catch (err) {
       if (attempt === retries) return null;
     }
@@ -44,18 +65,26 @@ async function proxyFetch(url, retries = 3, timeout = 30000) {
 // ============================================================
 async function getProxyInfo() {
   try {
-    const res  = await fetch('https://httpbin.org/ip', {
-      agent : new HttpsProxyAgent(PROXY_URL),
-      signal: AbortSignal.timeout(8000),
+    const result = await new Promise((resolve, reject) => {
+      https.get('https://httpbin.org/ip', {
+        agent: proxyAgent,
+        timeout: 8000,
+      }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          if (res.statusCode === 200) resolve(JSON.parse(data));
+          else reject(new Error(`HTTP ${res.statusCode}`));
+        });
+        res.on('error', reject);
+      }).on('error', reject);
     });
-    if (!res.ok) throw new Error('failed');
-    const data = await res.json();
     return {
       enabled : true,
       provider: 'Webshare Rotating',
       method  : 'webshare_rotating_proxy',
       endpoint: `${process.env.PROXY_HOST}:${process.env.PROXY_PORT}`,
-      ip      : data.origin ?? null,
+      ip      : result.origin ?? null,
       note    : 'Each request uses a different IP address',
     };
   } catch (e) {

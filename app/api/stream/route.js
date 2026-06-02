@@ -109,6 +109,10 @@ function formatSize(bytes) {
   return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
 }
 
+function mysqlNow() {
+  return new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+
 function encodePathSegments(path) {
   return path.split('/').map(s => encodeURIComponent(decodeURIComponent(s))).join('/');
 }
@@ -269,7 +273,7 @@ async function dbUpsertMovie(d) {
     d.tmdb_id, d.title??'', d.year??null, JSON.stringify(d.genres??[]),
     d.rating??null, d.overview??null, d.poster??null, d.tmdb_url??null,
     d.directory_url??null, JSON.stringify(d.files??[]),
-    d.total_files??0, d.cached_at??new Date().toISOString(),
+    d.total_files??0, d.cached_at??mysqlNow(),
   ]);
 }
 
@@ -285,7 +289,7 @@ async function dbUpsertTVMeta(d) {
   `, [
     d.tmdb_id, d.title??'', d.year??null, JSON.stringify(d.genres??[]),
     d.rating??null, d.overview??null, d.poster??null, d.tmdb_url??null,
-    d.cached_at??new Date().toISOString(),
+    d.cached_at??mysqlNow(),
   ]);
 }
 
@@ -300,7 +304,7 @@ async function dbUpsertEpisode(tmdbId, d) {
   `, [
     tmdbId, d.season, d.episode, d.directory_url??null,
     JSON.stringify(d.files??[]), d.total_files??0,
-    d.cached_at??new Date().toISOString(),
+    d.cached_at??mysqlNow(),
   ]);
 }
 
@@ -533,17 +537,17 @@ export async function GET(request) {
   const hasFiles = finalFiles.length > 0;
   if (hasFiles) {
     if (type === 'movie') {
-      const movieData = { ...tmdbMeta, directory_url:dirUrl, files:finalFiles, total_files:finalFiles.length, cached_at:new Date().toISOString() };
+      const movieData = { ...tmdbMeta, directory_url:dirUrl, files:finalFiles, total_files:finalFiles.length, cached_at:mysqlNow() };
       await dbUpsertMovie(movieData);
       await redisSet(redisKey.movie(tmdbId), movieData);
     } else {
       if (!metaFromCache) {
-        const metaData = { ...tmdbMeta, cached_at:new Date().toISOString() };
+        const metaData = { ...tmdbMeta, cached_at:mysqlNow() };
         await dbUpsertTVMeta(metaData);
         await redisSet(redisKey.tvMeta(tmdbId), metaData);
       }
       if (season && episode) {
-        const epData = { season:parseInt(season), episode:parseInt(episode), directory_url:dirUrl, files:finalFiles, total_files:finalFiles.length, cached_at:new Date().toISOString() };
+        const epData = { season:parseInt(season), episode:parseInt(episode), directory_url:dirUrl, files:finalFiles, total_files:finalFiles.length, cached_at:mysqlNow() };
         await dbUpsertEpisode(tmdbId, epData);
         await redisSet(redisKey.episode(tmdbId, season, episode), epData);
       }

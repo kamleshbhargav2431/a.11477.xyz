@@ -1,5 +1,6 @@
 // app/api/stream/route.js
 // Cache flow: Redis (30min) → DB → live fetch
+// Search flow: s.111477.xyz/search (with retry) → fallback directory scrape
 // GET /api/stream?tmdb_id=123&type=movie
 // GET /api/stream?tmdb_id=25&type=tv&season=1&episode=1
 
@@ -7,26 +8,35 @@ import { getPool }                      from '@/lib/db';
 import { redisGet, redisSet, redisKey } from '@/lib/redis';
 import { NextResponse }                 from 'next/server';
 import { HttpsProxyAgent }              from 'https-proxy-agent';
+import * as cheerio                     from 'cheerio';
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const PROXY_URL    = `http://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}:${process.env.PROXY_PORT}`;
+const BASE_URL     = 'https://a.111477.xyz';
 
 // ============================================================
-//  PROXY FETCH
+//  PROXY FETCH — with 3 retries + exponential backoff
 // ============================================================
-async function proxyFetch(url) {
-  try {
-    const res = await fetch(url, {
-      agent  : new HttpsProxyAgent(PROXY_URL),
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept'    : 'application/json, text/html',
-      },
-      redirect: 'follow',
-      signal  : AbortSignal.timeout(20000),
-    });
-    return res.ok ? res.text() : null;
-  } catch { return null; }
+async function proxyFetch(url, retries = 3, timeout = 30000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        agent  : new HttpsProxyAgent(PROXY_URL),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'Accept'    : 'application/json, text/html, */*',
+        },
+        redirect: 'follow',
+        signal  : AbortSignal.timeout(timeout),
+      });
+      if (res.ok) return await res.text();
+      if (res.status < 500 && res.status !== 429) return null;
+    } catch (err) {
+      if (attempt === retries) return null;
+    }
+    if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+  }
+  return null;
 }
 
 // ============================================================
@@ -77,7 +87,7 @@ function encodePathSegments(path) {
 function buildLink(item) {
   let p = item.path;
   if (!p.startsWith('/')) p = '/' + p;
-  return 'https://a.111477.xyz' + encodePathSegments(p);
+  return BASE_URL + encodePathSegments(p);
 }
 
 function normalizeTitle(t) {
@@ -88,12 +98,103 @@ function normalizeTitle(t) {
 }
 
 function scoreDir(dirName, normTitle, year) {
-  const norm     = normalizeTitle(dirName);
+  const norm    = normalizeTitle(dirName);
+  const stripped = norm.replace(/\d{4}/g, '').trim();
+  if (stripped.length === 0) return 0;
   const hasYear  = year && norm.includes(year);
-  const hasTitle = norm.includes(normTitle) || normTitle.includes(norm.replace(/\d{4}/g, '').trim());
+  const hasTitle = norm.includes(normTitle) || normTitle.includes(stripped);
   if (hasTitle && hasYear) return 3;
   if (hasTitle) return 1;
   return 0;
+}
+
+// ============================================================
+//  DIRECTORY SCRAPE FALLBACK
+// ============================================================
+async function scrapeDirectoryListing(url) {
+  const html = await proxyFetch(url, 3, 60000);
+  if (!html) return [];
+  const $ = cheerio.load(html);
+  const entries = [];
+  $('table tbody tr').each(function () {
+    const $row  = $(this);
+    const $link = $row.find('td.name a, td a');
+    const href  = $link.attr('href') || '';
+    const name  = $link.text().trim() || $row.find('td.name').attr('data-name') || '';
+    const size  = parseInt($row.find('td.size').attr('data-sort') || '0');
+    if (!name || href === '../' || href === '/' || name === 'Parent Directory') return;
+    entries.push({
+      name,
+      path: href.startsWith('/') ? href : '/' + href,
+      size,
+      is_dir: size === 0 || href.endsWith('/'),
+    });
+  });
+  return entries;
+}
+
+async function scrapeMovieFiles(title, year) {
+  const normTitle    = normalizeTitle(title);
+  const movieEntries = await scrapeDirectoryListing(`${BASE_URL}/movies/`);
+  if (!movieEntries.length) return [];
+  let bestDir = null, bestScore = 0;
+  for (const entry of movieEntries) {
+    const score = scoreDir(entry.name, normTitle, year);
+    if (score > bestScore) { bestScore = score; bestDir = entry; }
+  }
+  if (!bestDir || bestScore < 1) return [];
+  const dirPath = bestDir.path.replace(/\/$/, '');
+  const files   = await scrapeDirectoryListing(`${BASE_URL}${encodePathSegments(dirPath)}`);
+  return files.filter(f => !f.is_dir && f.size > 0).map(f => ({
+    name: f.name, size_human: formatSize(f.size), size_bytes: f.size,
+    download_url: BASE_URL + encodePathSegments(f.path),
+  })).sort((a, b) => b.size_bytes - a.size_bytes);
+}
+
+async function scrapeTvFiles(title, year, seasonNum, episodeNum) {
+  const normTitle = normalizeTitle(title);
+  const tvEntries = await scrapeDirectoryListing(`${BASE_URL}/tvs/`);
+  if (!tvEntries.length) return [];
+  let bestShow = null, bestScore = 0;
+  for (const entry of tvEntries) {
+    const norm     = normalizeTitle(entry.name);
+    const stripped = norm.replace(/\d{4}/g, '').trim();
+    if (stripped.length === 0) continue;
+    const hasTitle = norm.includes(normTitle) || normTitle.includes(stripped);
+    if (hasTitle) {
+      const hasYear = year && norm.includes(year);
+      const score   = hasYear ? 3 : 1;
+      if (score > bestScore) { bestScore = score; bestShow = entry; }
+    }
+  }
+  if (!bestShow || bestScore < 1) return [];
+  const showPath      = bestShow.path.replace(/\/$/, '');
+  const seasonEntries = await scrapeDirectoryListing(`${BASE_URL}${encodePathSegments(showPath)}`);
+  if (!seasonEntries.length) return [];
+  const targetSeason = seasonNum ? `Season ${seasonNum}` : '';
+  let seasonDir = null;
+  if (targetSeason) {
+    for (const entry of seasonEntries) {
+      if (entry.is_dir && entry.name.toLowerCase().includes(targetSeason.toLowerCase())) {
+        seasonDir = entry; break;
+      }
+    }
+  }
+  if (!seasonDir) return [];
+  const seasonPath = seasonDir.path.replace(/\/$/, '');
+  const files     = await scrapeDirectoryListing(`${BASE_URL}${encodePathSegments(seasonPath)}`);
+  return files.filter(f => {
+    if (f.is_dir || f.size <= 0) return false;
+    const ext = f.name.split('.').pop().toLowerCase();
+    if (!['mkv','mp4','avi','mov','wmv'].includes(ext)) return false;
+    if (!episodeNum) return true;
+    const s = String(seasonNum).padStart(2,'0');
+    const e = String(episodeNum).padStart(2,'0');
+    return new RegExp(`[Ss]${s}[Ee]${e}`,'i').test(f.name);
+  }).map(f => ({
+    name: f.name, size_human: formatSize(f.size), size_bytes: f.size,
+    download_url: BASE_URL + encodePathSegments(f.path),
+  })).sort((a, b) => b.size_bytes - a.size_bytes);
 }
 
 // ============================================================
@@ -194,10 +295,8 @@ export async function GET(request) {
   if (type === 'movie') {
     const cached = await redisGet(redisKey.movie(tmdbId));
     if (cached) return NextResponse.json({ ...cached, cache: 'redis' });
-
   } else {
     const redisMeta = await redisGet(redisKey.tvMeta(tmdbId));
-
     if (redisMeta && season && episode) {
       const redisEp = await redisGet(redisKey.episode(tmdbId, season, episode));
       if (redisEp) return NextResponse.json({ ...redisMeta, ...redisEp, cache: 'redis' });
@@ -214,20 +313,19 @@ export async function GET(request) {
   if (type === 'movie') {
     const dbRow = await dbFindMovie(tmdbId);
     if (dbRow) {
-      await redisSet(redisKey.movie(tmdbId), dbRow); // warm Redis
+      await redisSet(redisKey.movie(tmdbId), dbRow);
       return NextResponse.json({ ...dbRow, cache: 'db' });
     }
   } else {
     const dbMeta = await dbFindTVMeta(tmdbId);
-
     if (dbMeta && season && episode) {
       const dbEp = await dbFindEpisode(tmdbId, parseInt(season), parseInt(episode));
       if (dbEp) {
-        await redisSet(redisKey.tvMeta(tmdbId), dbMeta);             // warm Redis
-        await redisSet(redisKey.episode(tmdbId, season, episode), dbEp); // warm Redis
+        await redisSet(redisKey.tvMeta(tmdbId), dbMeta);
+        await redisSet(redisKey.episode(tmdbId, season, episode), dbEp);
         return NextResponse.json({ ...dbMeta, ...dbEp, cache: 'db' });
       }
-      metaFromCache = dbMeta; // meta cached but episode not
+      metaFromCache = dbMeta;
     } else if (dbMeta && !season && !episode) {
       await redisSet(redisKey.tvMeta(tmdbId), dbMeta);
       return NextResponse.json({ ...dbMeta, cache: 'db' });
@@ -243,14 +341,11 @@ export async function GET(request) {
     const tmdbUrl = type === 'movie'
       ? `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${TMDB_API_KEY}`
       : `https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${TMDB_API_KEY}`;
-
     const tmdbRaw = await proxyFetch(tmdbUrl);
     if (!tmdbRaw) return NextResponse.json({ error: 'Failed to fetch from TMDB' }, { status: 502 });
-
     const d = JSON.parse(tmdbRaw);
     title   = type === 'movie' ? (d.title ?? '') : (d.name ?? '');
     year    = type === 'movie' ? (d.release_date ?? '').slice(0, 4) : (d.first_air_date ?? '').slice(0, 4);
-
     tmdbMeta = {
       tmdb_id : tmdbId,
       title,
@@ -269,117 +364,127 @@ export async function GET(request) {
   }
 
   // ============================================================
-  //  STEP 4 — Search
-  // ============================================================
-  let searchQuery = title;
-  if (type === 'tv' && season && episode) {
-    searchQuery = `${title} s${season.padStart(2,'0')}e${episode.padStart(2,'0')}`;
-  }
-
-  const searchRaw = await proxyFetch(`https://s.111477.xyz/search?q=${encodeURIComponent(searchQuery)}&limit=50&sort=score`);
-  if (!searchRaw) return NextResponse.json({ error: 'Failed to fetch search results' }, { status: 502 });
-
-  let results;
-  try { results = JSON.parse(searchRaw); } catch {
-    return NextResponse.json({ error: 'Invalid search response' }, { status: 502 });
-  }
-  if (!Array.isArray(results)) return NextResponse.json({ error: 'Invalid search response' }, { status: 502 });
-
-  // ============================================================
-  //  STEP 5 — Find best directory
-  // ============================================================
-  const dirs      = results.filter(r => r.is_dir === true);
-  const files     = results.filter(r => r.is_dir === false);
-  const normTitle = normalizeTitle(title);
-  let   bestDir   = null, bestScore = 0;
-
-  for (const dir of dirs) {
-    const score = scoreDir(dir.name, normTitle, year);
-    if (score > bestScore) { bestScore = score; bestDir = dir; }
-  }
-
-  // ============================================================
-  //  STEP 6 — Fetch directory listing
+  //  STEP 4 — Search via s.111477.xyz (with fallback to scrape)
   // ============================================================
   let finalFiles = [], dirUrl = null;
+  let searchMethod = 'search_api';
 
-  if (bestDir && bestScore >= 1) {
-    dirUrl = type === 'tv' && season
-      ? buildLink(bestDir).replace(/\/$/, '') + `/Season%20${parseInt(season)}/`
-      : buildLink(bestDir);
+  const searchQuery = title;
+  const searchRaw = await proxyFetch(`https://s.111477.xyz/search?q=${encodeURIComponent(searchQuery)}&limit=50&sort=score`);
 
-    const dirHtml = await proxyFetch(dirUrl);
-    if (dirHtml) {
-      const rowRe = /<tr[^>]*data-name="([^"]+)"[^>]*data-url="([^"]+)"[^>]*>.*?<td class="size"[^>]*data-sort="(\d+)"/gs;
-      let match;
-      while ((match = rowRe.exec(dirHtml)) !== null) {
-        const fileSize = parseInt(match[3]);
-        if (fileSize <= 0) continue;
-        finalFiles.push({
-          name        : match[1].replace(/&quot;/g,'"').replace(/&amp;/g,'&'),
-          size_human  : formatSize(fileSize),
-          size_bytes  : fileSize,
-          download_url: 'https://a.111477.xyz' + encodePathSegments('/' + decodeURIComponent(match[2].replace(/&amp;/g,'&')).replace(/^\//,'')),
-        });
+  if (searchRaw) {
+    let results;
+    try { results = JSON.parse(searchRaw); } catch { results = null; }
+
+    if (Array.isArray(results)) {
+      const dirs      = results.filter(r => r.is_dir === true);
+      const files     = results.filter(r => r.is_dir === false);
+      const normTitle = normalizeTitle(title);
+      let   bestDir   = null, bestScore = 0;
+
+      for (const dir of dirs) {
+        const score = scoreDir(dir.name, normTitle, year);
+        if (score > bestScore) { bestScore = score; bestDir = dir; }
       }
+
+      if (bestDir && bestScore >= 1) {
+        dirUrl = type === 'tv' && season
+          ? buildLink(bestDir).replace(/\/$/, '') + `/Season%20${parseInt(season)}/`
+          : buildLink(bestDir);
+        const dirHtml = await proxyFetch(dirUrl);
+        if (dirHtml) {
+          const rowRe = /<tr[^>]*data-name="([^"]+)"[^>]*data-url="([^"]+)"[^>]*>.*?<td class="size"[^>]*data-sort="(\d+)"/gs;
+          let match;
+          while ((match = rowRe.exec(dirHtml)) !== null) {
+            const fileSize = parseInt(match[3]);
+            if (fileSize <= 0) continue;
+            finalFiles.push({
+              name        : match[1].replace(/&quot;/g,'"').replace(/&amp;/g,'&'),
+              size_human  : formatSize(fileSize),
+              size_bytes  : fileSize,
+              download_url: BASE_URL + encodePathSegments('/' + decodeURIComponent(match[2].replace(/&amp;/g,'&')).replace(/^\//,'')),
+            });
+          }
+        }
+      }
+
+      if (!finalFiles.length) {
+        const videoExts   = ['mkv','mp4','avi','mov','wmv'];
+        const s           = (type==='tv'&&season)  ? season.padStart(2,'0')  : '';
+        const e           = (type==='tv'&&episode) ? episode.padStart(2,'0') : '';
+        const scoredFiles = [];
+
+        for (const item of files) {
+          const name = item.name ?? '';
+          const path = item.path ?? '';
+          if (!videoExts.includes(name.split('.').pop().toLowerCase())) continue;
+          const normPath = '/' + path.replace(/^\//,'');
+          if (type==='tv'    && !/\/tvs\//i.test(normPath))    continue;
+          if (type==='movie' && !/\/movies\//i.test(normPath)) continue;
+          const normName = normalizeTitle(name);
+          const normPL   = normalizeTitle(normPath);
+          let   score    = 0;
+          if (year && (normName.includes(year)||normPL.includes(year))) score += 40; else continue;
+          const fm = normPath.match(/\/(?:tvs|movies)\/([^/]+)\//);
+          if (fm) {
+            const fn     = fm[1].replace(/\d{4}/g,'').trim();
+            if (fn.length === 0) continue;
+            const longer = Math.max(normTitle.length, fn.length);
+            const common = [...normTitle].filter(c => fn.includes(c)).length;
+            const pct    = longer ? (common/longer)*100 : 0;
+            if (pct < 70) continue;
+            score += Math.floor(pct*0.5);
+          } else continue;
+          if (normPL.includes(normTitle))   score += 50;
+          if (normName.includes(normTitle)) score += 30;
+          if (type==='tv'&&s&&e) {
+            if (new RegExp(`[Ss]${s}[Ee]${e}`,'i').test(name)) score += 20; else continue;
+          }
+          scoredFiles.push({
+            name, size_human: formatSize(parseInt(item.size)),
+            size_bytes: parseInt(item.size),
+            download_url: BASE_URL + encodePathSegments('/'+path.replace(/^\//,'')),
+            _score: score,
+          });
+        }
+        scoredFiles.sort((a,b) => b._score!==a._score ? b._score-a._score : b.size_bytes-a.size_bytes);
+        if (scoredFiles.length) {
+          const best = scoredFiles[0]._score;
+          for (const f of scoredFiles) {
+            if (f._score >= best-20) { const {_score,...rest}=f; finalFiles.push(rest); }
+          }
+        }
+      }
+    } else {
+      searchMethod = 'directory_scrape';
     }
+  } else {
+    searchMethod = 'directory_scrape';
   }
 
   // ============================================================
-  //  STEP 7 — Fallback: score files from search results
+  //  STEP 8 — Directory scrape fallback (when search unavailable)
   // ============================================================
-  if (!finalFiles.length) {
-    const videoExts   = ['mkv','mp4','avi','mov','wmv'];
-    const s           = (type==='tv'&&season)  ? season.padStart(2,'0')  : '';
-    const e           = (type==='tv'&&episode) ? episode.padStart(2,'0') : '';
-    const scoredFiles = [];
-
-    for (const item of files) {
-      const name = item.name ?? '';
-      const path = item.path ?? '';
-      if (!videoExts.includes(name.split('.').pop().toLowerCase())) continue;
-
-      const normPath = '/' + path.replace(/^\//,'');
-      if (type==='tv'    && !/\/tvs\//i.test(normPath))    continue;
-      if (type==='movie' && !/\/movies\//i.test(normPath)) continue;
-
-      const normName = normalizeTitle(name);
-      const normPL   = normalizeTitle(normPath);
-      let   score    = 0;
-
-      if (year && (normName.includes(year)||normPL.includes(year))) score += 40; else continue;
-
-      const fm = normPath.match(/\/(?:tvs|movies)\/([^/]+)\//);
-      if (fm) {
-        const fn     = fm[1].replace(/\d{4}/g,'').trim();
-        const longer = Math.max(normTitle.length, fn.length);
-        const common = [...normTitle].filter(c => fn.includes(c)).length;
-        const pct    = longer ? (common/longer)*100 : 0;
-        if (pct < 70) continue;
-        score += Math.floor(pct*0.5);
-      } else continue;
-
-      if (normPL.includes(normTitle))   score += 50;
-      if (normName.includes(normTitle)) score += 30;
-
-      if (type==='tv'&&s&&e) {
-        if (new RegExp(`[Ss]${s}[Ee]${e}`,'i').test(name)) score += 20; else continue;
+  if (searchMethod === 'directory_scrape' && !finalFiles.length) {
+    try {
+      if (type === 'movie') {
+        finalFiles = await scrapeMovieFiles(title, year);
+        if (finalFiles.length) {
+          const fu = finalFiles[0].download_url;
+          const m  = fu.match(/https:\/\/[^/]+(\/[^?]+\/)/i);
+          if (m) dirUrl = BASE_URL + m[1];
+        }
+      } else {
+        const epNum = episode ? parseInt(episode) : null;
+        finalFiles = await scrapeTvFiles(title, year, season ? parseInt(season) : null, epNum);
+        if (finalFiles.length) {
+          const fu = finalFiles[0].download_url;
+          const m1 = fu.match(/https:\/\/[^/]+(\/[^?]+\/Season\s*\d+\/)/i);
+          if (m1) dirUrl = BASE_URL + m1[1];
+        }
       }
-
-      scoredFiles.push({
-        name, size_human: formatSize(parseInt(item.size)),
-        size_bytes: parseInt(item.size),
-        download_url: 'https://a.111477.xyz' + encodePathSegments('/'+path.replace(/^\//,'')),
-        _score: score,
-      });
-    }
-
-    scoredFiles.sort((a,b) => b._score!==a._score ? b._score-a._score : b.size_bytes-a.size_bytes);
-    if (scoredFiles.length) {
-      const best = scoredFiles[0]._score;
-      for (const f of scoredFiles) {
-        if (f._score >= best-20) { const {_score,...rest}=f; finalFiles.push(rest); }
-      }
+    } catch (err) {
+      console.error('Directory scrape fallback error:', err);
     }
   }
 
@@ -389,15 +494,14 @@ export async function GET(request) {
     const fu = finalFiles[0].download_url ?? '';
     const m1 = fu.match(/https:\/\/[^/]+(\/[^?]+\/Season\s*\d+\/)/i);
     const m2 = fu.match(/https:\/\/[^/]+(\/[^/]+\/[^/]+\/[^/]+\/)/i);
-    if (m1) dirUrl = 'https://a.111477.xyz'+m1[1];
-    else if (m2) dirUrl = 'https://a.111477.xyz'+m2[1];
+    if (m1) dirUrl = BASE_URL + m1[1];
+    else if (m2) dirUrl = BASE_URL + m2[1];
   }
 
   // ============================================================
-  //  STEP 8 — Save to DB + Redis
+  //  STEP 9 — Save to DB + Redis
   // ============================================================
   const hasFiles = finalFiles.length > 0;
-
   if (hasFiles) {
     if (type === 'movie') {
       const movieData = { ...tmdbMeta, directory_url:dirUrl, files:finalFiles, total_files:finalFiles.length, cached_at:new Date().toISOString() };
@@ -418,16 +522,17 @@ export async function GET(request) {
   }
 
   // ============================================================
-  //  STEP 9 — Response
+  //  STEP 10 — Response
   // ============================================================
   const proxyInfo = await getProxyInfo();
   const response  = {
     ...tmdbMeta,
-    directory_url: dirUrl,
-    files        : finalFiles,
-    total_files  : finalFiles.length,
-    proxy        : proxyInfo,
-    cache        : hasFiles ? 'stored' : 'miss_no_files',
+    directory_url : dirUrl,
+    files         : finalFiles,
+    total_files   : finalFiles.length,
+    proxy         : proxyInfo,
+    search_method : searchMethod === 'search_api' ? 'search_api (s.111477.xyz)' : 'directory_scrape (fallback)',
+    cache         : hasFiles ? 'stored' : 'miss_no_files',
   };
 
   if (type==='tv' && season && episode) {

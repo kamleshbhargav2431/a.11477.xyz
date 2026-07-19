@@ -149,11 +149,17 @@ function normalizeTitle(t) {
 
 /**
  * Stop-words that carry no discriminating value for title matching.
- * Note: "the" is intentionally EXCLUDED because it appears in many
- * meaningful titles ("The Dark Knight", "The Matrix", "The Godfather").
+ *
+ * "the" is INCLUDED because it is a determiner, not a content word —
+ * it creates false bridges between unrelated titles that happen to share
+ * "the" (e.g. "The East Palace" vs "Empresses in the Palace").
+ *
+ * Removing "the" does NOT hurt legitimate matches:
+ *   "The Dark Knight" → tokens ["dark", "knight"]
+ *   "Dark Knight"     → tokens ["dark", "knight"]  → still perfect match
  */
 const STOP_WORDS = new Set([
-  'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or',
+  'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or',
   'but', 'is', 'it', 'its',
 ]);
 
@@ -299,19 +305,33 @@ function scoreDir(dirName, normTitle, year) {
     score = Math.round(score * 0.3);
   }
 
-  // --- Safety gate 2: superset penalty ---
-  // If dir name CONTAINS the full title as a substring but also has extra
-  // significant words, it's likely a sequel/spinoff/different title.
-  // e.g. "The Dark Knight Rises" contains "The Dark Knight" but is a different movie.
-  // We count how many dir tokens are NOT in the title tokens ("extra" words).
-  if (dirContainsTitle && !isExactMatch) {
-    const titleSet = new Set(titleTokens);
-    const extraWords = dirTokens.filter(t => !titleSet.has(t));
-    if (extraWords.length > 0) {
-      // Each extra significant word reduces score by 30 pts
-      // "The Dark Knight" vs "The Dark Knight Rises" → 1 extra word → -30
-      // "The Godfather" vs "The Godfather Part II" → 2 extra (part, ii) → -60
+  // --- Safety gate 2: extra-words penalty ---
+  // If the directory name has significant content words that are NOT in the
+  // search title, it's likely a different show/movie that merely shares some
+  // common words.
+  //
+  // Two tiers:
+  //   a) dir CONTAINS the full title as substring (strong signal of sequel/spinoff):
+  //      e.g. "The Dark Knight Rises" contains "The Dark Knight" → harsh penalty
+  //   b) dir does NOT contain the full title but has extra words:
+  //      e.g. "Empresses in the Palace" has "empresses" not in "The East Palace"
+  //      → moderate penalty (the Jaccard/coverage metrics already reduced the
+  //        score somewhat, but extra content words should push it further down)
+  //
+  const titleSet = new Set(titleTokens);
+  const extraWords = dirTokens.filter(t => !titleSet.has(t));
+  if (extraWords.length > 0) {
+    if (dirContainsTitle && !isExactMatch) {
+      // Tier (a): each extra word → -30 pts
+      // "The Dark Knight" vs "The Dark Knight Rises" → 1 extra → -30
+      // "The Godfather" vs "The Godfather Part II" → 2 extra → -60
       score -= extraWords.length * 30;
+    } else if (!dirContainsTitle) {
+      // Tier (b): each extra content word → -12 pts
+      // "The East Palace" vs "Empresses in the Palace" → 1 extra (empresses) → -12
+      // This ensures that even with some word overlap, truly different titles
+      // with extra distinguishing words fall below the minimum threshold.
+      score -= extraWords.length * 12;
     }
   }
 
